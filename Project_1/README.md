@@ -1,5 +1,5 @@
 
-#Introduction:
+Introduction:
 
 Our study, led by Dr. Lauren Micalizzi from the Department of Behavioral and Social Sciences, aims to
 understand how smoking during pregnancy and exposure to secondhand smoke affect children as they grow
@@ -9,7 +9,7 @@ The goal is to get a clear picture of how smoke exposure in early life might lea
 later on, which could help in creating better public health policies.
 
 
-#Packages used:
+Packages used:
 
 | Package      | Latest Version |
 |--------------|----------------|
