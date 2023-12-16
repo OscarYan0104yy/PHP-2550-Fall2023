@@ -1,7 +1,10 @@
 # PHP-2550-Fall2023
 This is a repository that presents all three revised projects in the course: PHP 2550 Fall 2022
-Detailed codes and reports are each stored at respective branches to this repository. The following are a short introduction to the three projects:
+Detailed codes and reports are each stored at respective folders to this repository. The following are a short introduction to the three projects:
 
+Data from Project 1 and 2 are only available on class level, data from project 3 is publicly available
+
+Codes and reports are all publicly avaliable
 
 Project 1: Exploratory Data Analysis on Tobacco Exposure and Adolescent Behavior
 
