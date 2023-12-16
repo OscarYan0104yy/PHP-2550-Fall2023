@@ -23,3 +23,9 @@ Package:
 | lme4          | 1.1-34     |
 | L0Learn       | 2.1.0      |
 | modelsummary  | 1.4.3      |
+
+File Management:
+
+proj2_revised.Rmd <- Report code
+
+proj2_revised.pdf <- Report
