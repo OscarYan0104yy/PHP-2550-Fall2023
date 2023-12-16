@@ -1,0 +1,711 @@
+---
+title: "Tranportability Case-study and Simulation Analysis"
+author: "Yu Yan"
+date: "2023-11-29"
+output:
+  pdf_document: 
+    latex_engine: pdflatex
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(error = F)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(message = F)
+library(dplyr)
+library(tableone)
+library(mice)
+library(finalfit)
+library(mvnormtest)
+library(MASS)
+library(kableExtra)
+library(gtsummary)
+```
+
+```{r}
+# read datasets
+framingham_df <- read.csv('framingham_df.csv')
+df_2017 <- read.csv('df_2017.csv')
+```
+
+# Abstract
+
+Background: Risk prediction models like the Framingham Heart Study are integral to clinical decision-making yet face hurdles when applied across diverse populations. This case study employs transportability analysis, following the methodology by Dr. Steingrimsson et al., to adapt the Framingham model for the NHANES target population. It also aims to compare the effectiveness of data-based and simulation-based transportability approaches.
+
+Methods: This dual-goal analysis commenced with the evaluation of the Framingham model using NHANES data, focusing on performance metrics such as the Brier Score. The first approach involved direct application and modification of the model using inverse-odds weighting on combined data sets. The second goal introduced a simulation-based approach, generating data reflective of individual-level statistics from summary data to test transportability. Monte Carlo simulation methodology was employed and simulation bias are reported for evaluation.
+
+Results: The study observed high predictive accuracy within the NHANES cohort, with gender-based analysis showing higher accuracy for females. The simulation-based approach, involving varying data generation mechanisms, aimed to reproduce individual-level data from summary statistics, providing insights into model applicability and performance under different scenarios. The bias in estimates from the simulation approach was compared with the data-based approach to assess the efficacy and feasibility of each method.
+
+Conclusions: Findings suggest that both transportability approaches can effectively adapt the Framingham model to the NHANES population with minimal bias, highlighting the potential of simulation-based methods in scenarios where individual data is unavailable. This comparative study underscores the importance of considering various data generation methods in transportability analysis, ultimately broadening the applicability of predictive models in healthcare.
+
+# Introduction
+
+Transferring a health risk prediction model from one group of people to another can be challenging, especially when the groups are very different. The well-known Framingham Heart Study has created a model that predicts heart health risks, but it's mostly been used on people within the study. Our goal is to see if this model can also work well for people in the NHANES study, which collects health and nutrition data from a wide range of Americans but doesn't have longitudinal heart related health outcomes
+
+This study will use comparisons between data-based and simulation based approaches to estimate how well the Framingham model can predict health outcomes for the NHANES group. We'll do this by using the detailed health information from NHANES, along with the patterns of heart health outcomes from the Framingham study, to create a simulated set of results. In doing so, we'll also carefully apply the Framingham study's criteria to the NHANES data. Our analysis aims to show how well the Framingham heart risk model can be adapted for use with different groups of people.
+
+# Data Processing
+
+In the data processing part, since the Framingham data is provided as filtered and complete, we will create a new variable of source and give it a value of 1 indicate it as source population, and filter age range as 30-74, indicated by [B. D'AgostinoSr](https://www.ahajournals.org/doi/10.1161/CIRCULATIONAHA.107.699579# "Ralph B. D’AgostinoSr") et.al[@dagostino2008]. For the nhanes data, we will do some processing as follows: filter out observations whose age is above 30 and below 74 as the eligibility criteria that matches the setting of Framingham heart study, and then created both 'SYSBP_UT' and 'SYSBP_T' the same way in the processing of Framingham data. Lastly we added 'source' and give it a value of 0 indicating this is target data. As the model that we are evaluating is stratified by different sex, we will also divide both data by sex as subsets, and perform transportability analysis seperately.
+
+```{r}
+# data processing 
+framingham_df <- framingham_df %>% 
+  # Eligibility Criteria
+  filter(AGE>30 , AGE<74)
+
+framingham_df$source = 1
+
+df_2017_el <- df_2017 %>% 
+  # Eligibility Criteria
+  filter(AGE>30 , AGE<74) %>% 
+  # new cols
+  mutate(SYSBP_UT = ifelse(BPMEDS == 0, 
+                           SYSBP, 0)) %>% 
+  mutate(SYSBP_T = ifelse(BPMEDS == 1, 
+                          SYSBP, 0)) %>% 
+  # source column
+  mutate(source=0) 
+
+# delete id column
+df_2017_el <-  df_2017_el[,-1]
+
+# change variable format 
+factor_col <- c('SEX','CURSMOKE','DIABETES','BPMEDS')
+
+
+# men=0,women=1
+framingham_df$SEX <- ifelse(framingham_df$SEX==1,0,1)
+df_2017_el$SEX <- ifelse(df_2017_el$SEX==1,0,1)
+
+# change to factor
+framingham_df <- framingham_df %>% mutate_at(factor_col,as.factor)
+df_2017_el <- df_2017_el %>% mutate_at(factor_col,as.factor)
+
+# Filter to each sex
+framingham_df_men <- framingham_df %>% filter(SEX == 0)
+framingham_df_women <- framingham_df %>% filter(SEX == 1)
+```
+
+The followings are demographics of the two datasets after preliminary processing:
+
+In the table of summary statistics of complete case Nhanes and Framinghan, We displayed several crucial variables that we filtered out. Those variables are basically the ones that are used by the CVD prediction model that we are evaluating. All of the differences between them seem statistically significant.
+
+```{r}
+# get summary stats of nhanes
+continuous_vars <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI")
+report_vars <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES",'SEX','CURSMOKE')
+
+framingham_df_log <- framingham_df %>% mutate_at(continuous_vars,log)
+df_2017_log <- df_2017_el %>% mutate_at(continuous_vars,log)
+
+log_total <- bind_rows(framingham_df_log,df_2017_log)
+
+log_total %>% select("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES",'SEX','CURSMOKE','source') %>% 
+  tbl_summary(by = source,missing = 'no') %>%
+  add_p() %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Population Membership**") %>%
+  # convert to kableExtra
+  as_kable_extra(booktabs = TRUE, caption = "Summary Statistics of Nhance(0) and Framinghan(1) data") %>%
+  # reduce font size to make table fit. 
+  kableExtra::kable_styling(full_width = T, font_size = 7)
+
+#mshapiro.test(t(as.matrix(framingham_df[,continuous_vars])))
+```
+
+We also displayed histograms of continuous variables from Framingham dataset as a reference. One of the assumptions of the transportability analysis is related to the distribution of covarites in both target and source population. As later stage in the report, we will rely on such distributions to simulate 'pseudo' Nhanes data.
+
+```{r}
+par(mfrow = c(2,2))
+hist(framingham_df$TOTCHOL,main = 'Histogram of Total Cholestrol',xlab ='Total Cholestrol')
+hist(framingham_df$AGE, main = 'Histogram of Age',xlab ='Age')
+hist(framingham_df$SYSBP,main = 'Histogram of Systolic Blood Pressure',xlab ='Systolic Blood Pressure')
+hist(framingham_df$HDLC,main = 'Histogram of High-density Lipoprotein Cholesterol',xlab ='High-density Lipoprotein Cholesterol')
+
+par(mfrow = c(1,1))
+hist(framingham_df$BMI,main = 'Histogram of BMI',xlab ='BMI')
+```
+
+From the frequency, we can see that except for age, the other continuous variables looks close to normal. We will further testify their distribution later during the simulation part.
+
+# Methods
+
+In order to follow the original transportability analysis, this report will follow the following general analytically design:
+
+1.  Acquiring both source data and target data. The goal is to see how a candidate model, which is build based on the source data, would perform on the target data. The evaluation used is Brier Score
+
+2.  If the model is mis-specified, modify the model on the combined training dataset of source and target to get a tailored model. Then evaluate this model on combined test data set of source and target.
+
+    The model has the following formula
+
+    $$
+    \log\left(\frac{P(CVD)}{1-P(CVD)}\right)=\log(HDLC) +\log(TCHOL)+\log(AGE)+\log(SYSBP_{UT}+1)\\
+    +\log(SYSBP_{T}+1)+SMK+DIB
+    $$
+
+3.  For generating tailored model, first estimate the probability of source population membership using training data form the source population. Second use the estimated probability to construct inverse-odds weights for the same observations. Lastly, apply the inverse-odds weights to estimate a tailor model using all source and training dataset observation.
+
+4.  The final step is to evaluate this tailored model on the pre-separated test data sets using the Brier score Estimator as follows:
+
+    $$\hat{\psi}_{\hat{\beta}}=\frac{\sum_{i=1}^n I\left(S_i=1, D_{\text {test }, i}=1\right) \hat{o}\left(X_i\right)\left(Y_i-g_{\hat{\beta}}\left(X_i\right)\right)^2}{\sum_{i=1}^n I\left(S_i=0, D_{\text {test }, i}=1\right)}$$
+
+    where
+
+    $$
+    \hat{o} = \frac{\operatorname{Pr}\left[S=0 \mid X, D_{\text {test }}=1\right]}{\operatorname{Pr}\left[S=1 \mid X, D_{\text {test }}=1\right]}
+    $$
+
+Starting form train-test split, since there's missingness in the target Nhanes data, we will use mice function[@mice] to impute the missing data and also incorporate training test split process. By the end of MICE stage, we will have 5 unique train and test sets from target population with 75% vs 25% proportion. Next, for each of the train data of target, we will combine it with the same proportion splitted train set of source population to get a combined training set that is complete and ready for model tailoring. We will conduct the process for both men and women splitted subsets since the model should be evaluated on through such stratification and thus also tailored on such stratification.
+
+In conclusion, with our 5 time imputation, we will end up with two lists of brier scores, one for men and the other for women. In each list, it consists of 5 different estimators of brier scores, which represent corresponding tailored model from combined training data, evaluated on combined test data. We will use average of each list as our final results for the transportability analysis.
+
+```{r}
+
+missing_byvar <- sort(apply(df_2017_el[,-c(10,11,12)], 2, function(x) (sum(is.na(x))/nrow(df_2017_el))*100),decreasing = T) 
+
+missing_byvar[missing_byvar>0] %>% 
+  kable(booktabs = TRUE, caption = "Variables with missingness",col.names = 'Missing Percentage') %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") 
+
+# mice
+# MICE and test train split
+set.seed(2550)
+ignore <- sample(c(TRUE, FALSE), size = nrow(df_2017_el), replace = TRUE, prob = c(0.25, 0.75))
+
+
+nhanes.imp <- mice(df_2017_el, m = 5, ignore = ignore, print = FALSE, seed = 2550)
+
+imp_train <- filter(nhanes.imp, !ignore)
+
+nhanes_imp_train_long <- mice::complete(imp_train,action="long")
+
+# Store each imputed data set (Train)
+nhanes_imp_train <- vector("list",5)    
+for (i in 1:5){
+  nhanes_imp_train[[i]] <- mice::complete(imp_train,i) 
+}
+
+
+imp.test <- filter(nhanes.imp, ignore)
+
+# Store each imputed data set (Test) long format
+nhanes_imp_test_long <- mice::complete(imp.test,action="long")
+
+# t t split for framingham
+set.seed(2550)
+ignore_men <- sample(c(TRUE, FALSE), size = nrow(framingham_df_men), replace = TRUE, prob = c(0.25, 0.75))
+ignore_women <- sample(c(TRUE, FALSE), size = nrow(framingham_df_women), replace = TRUE, prob = c(0.25, 0.75))
+
+framingham_men_train <- framingham_df_men[!ignore_men,]
+framingham_men_test <- framingham_df_men[ignore_men,]
+
+framingham_women_train <- framingham_df_women[!ignore_women,]
+framingham_women_test <- framingham_df_women[ignore_women,]
+```
+
+```{r}
+# formulas
+member_formula <- as.formula(source~log(HDLC)+log(TOTCHOL)+log(AGE)+log(SYSBP_UT+1)+
+                             log(SYSBP_T+1)+CURSMOKE+DIABETES)
+
+pred_formula <- as.formula(CVD~log(HDLC)+log(TOTCHOL)+log(AGE)+log(SYSBP_UT+1)+
+  log(SYSBP_T+1)+CURSMOKE+DIABETES)
+```
+
+```{r}
+# Helper Function
+# inverse-odds weights estimator
+iv_weight <-  function(fit_dat, pred_dat){
+  
+  # get probability of membership
+  prob_mod <- glm(member_formula, data = fit_dat,
+                  family= "binomial")
+  
+  w <- (1 - predict(prob_mod,newdata = pred_dat,type = 'response')) / 
+    (predict(prob_mod,newdata = pred_dat,type = 'response'))
+  
+  return(w)
+  
+}
+
+# Brier Score extimator 
+########################## Debugged, 2023.12.9: should explicitely insert model formula, rather than using the external objects
+# brier score estimator 
+
+# old ver. not working
+brier_estimator <- function(train,weight) {
+  w <- weight
+  # get tailored model
+  mod <- glm(pred_formula,data = train[train$source==1,], family= "binomial")
+  
+  source_index = which(total_test$source==1)
+  
+  w_test <- iv_weight(fit_dat = total_test,pred_dat = total_test[total_test$source==1,])
+  
+  weighted_eval <- 
+  (total_test[source_index,]$CVD - 
+     ifelse(predict(mod,newdata = total_test[source_index,],type = 'response')>=0.5,1,0) )^2
+  
+  denominator <- sum(w_test * weighted_eval)
+  
+  numerator <- sum(total_test$source==0)
+  
+  return(denominator/numerator)
+}
+
+# new ver. working
+get_brier <- function(train_dat,test_data){
+  
+  train <- train_dat
+  test <- test_data
+  # weights for tailored model
+  weight <- iv_weight(fit_dat = train,pred_dat = train[train$source==1,])
+  
+  # get tailored model
+  mod <- glm(CVD~log(HDLC)+log(TOTCHOL)+log(AGE)+log(SYSBP_UT+1)+
+  log(SYSBP_T+1)+CURSMOKE+DIABETES, weights = weight,data = train[train$source==1,], family= "binomial")
+  
+  # weights for evaluation on test data
+  w_test <- iv_weight(fit_dat = test,pred_dat = test[test$source==1,])
+  
+  weighted_eval <- 
+  (test[test$source==1,]$CVD - 
+     ifelse(predict(mod,newdata = test[test$source==1,],type = 'response')>=0.5,1,0) )^2
+  
+  denominator <- sum(w_test * weighted_eval)
+  
+  numerator <- sum(test$source==0)
+  
+  return(denominator/numerator)
+}
+```
+
+# Model Evaluation
+
+```{r }
+# Form seperate combined testing dataset for men and women 
+men_test <- bind_rows(nhanes_imp_test_long[nhanes_imp_test_long$SEX==0,],framingham_men_test)
+women_test <- bind_rows(nhanes_imp_test_long[nhanes_imp_test_long$SEX==1,],framingham_women_test)
+```
+
+```{r}
+# Form 5 combined training set for men 
+nhanes_imp_train_men <-  lapply(nhanes_imp_train, function(dataset) {
+  df <- bind_rows(dataset[dataset$SEX==0,],framingham_df)
+  return(as.data.frame(df))
+})
+
+# Form 5 combined training set for women
+nhanes_imp_train_women <-  lapply(nhanes_imp_train, function(dataset) {
+  df <- bind_rows(dataset[dataset$SEX==1,],framingham_df)
+  return(as.data.frame(df))
+})
+
+# Get brier list result for men data
+brier_list_men <- unlist(lapply(nhanes_imp_train_men, get_brier,men_test))
+
+
+# Get brier list result for women data
+brier_list_women <- unlist(lapply(nhanes_imp_train_women, get_brier,women_test))
+```
+
+The Brier Score measures the accuracy of predicted probabilities for binary outcomes. It ranges from 0 to 1, with lower values indicating better predictive accuracy. We can observe relative consistency of output across imputation for both male and female. The average brier score for male is about 0.1307 and that of women is 0.0557. While both value are very close to 0, indicating good predictive accuracy. This translates to the following conclusion:
+
+Through transportability analysis, the prediction model derived based on Framingham data is evaluated to be also perform very well in the Nhanes data. Predictive accuracy of women subset is better than that of men subset.
+
+```{r}
+# Result Reporting
+
+brier_list_men[6] <- mean(brier_list_men)
+names(brier_list_men) <- c('M1','M2','M3','M4','M5','Mean')
+
+as.data.frame(round(t(brier_list_men),4))%>% 
+  kable(booktabs = TRUE, caption = "Brier Score results for Men") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position")
+
+brier_list_women[6] <- mean(brier_list_women)
+names(brier_list_women) <- c('M1','M2','M3','M4','M5','Mean')
+
+as.data.frame(round(t(brier_list_women),4))%>% 
+  kable(booktabs = TRUE, caption = "Brier Score results for Women") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position")
+```
+
+# Simulation
+
+We will simulate individual level data from the summary of Nhanes data with insights gained from Framingham data, which is the source data.
+
+The aim of this simulation study is to test the transportability of CVD-prediction model generated on the Framingham data to target population in different distributions(Similarity of target population to source population). We will use several different data generation mechanisms to generate individual level data of Nhanes. The different data generation mechanisms will incorporate situations where the simulated data is very close to distribution of the source population and not close to it. For each data generation mechanisms, we will run 5000 simulations using the same method from the above, and report average brier score for each scenario of data generation. The reason for choosing number of simulation to be 5,000 was based on the following reasons: referring to the objectives of the study, we want to how each estimators compare to the true value of brier score and a similar example provided in the reference paper used 10,000 number of simulations. In consideration of computation time and higher model complexity in comparison to the reference paper simulation example, we decided to use 5,000 number of simulations. We will also compare the estimators to the man and women brier score from the actual data as the true estimands. The performance measures is the respective averaged brier score from each of the different data generating process. It will be compared to non-simulated Nhanes dataset which corresponds to the results from the upper section. Seed for simulation experiments is set in the very beginning of this section as 2550 for reproducibility.
+
+To start, we present this logged summary statistics from Nhanes data.
+
+```{r}
+df_2017_log_sum_c <- df_2017_log %>% select_at(continuous_vars) %>% 
+  summarise_all(.funs = list(
+    mean = ~mean(.,na.rm = TRUE),
+    sd = ~sd(.,na.rm = TRUE)
+  ))
+
+sum_df <- rbind(paste(round(df_2017_log_sum_c[1], 2), "(", round(df_2017_log_sum_c[6], 2), ")",sep = ''),
+      paste(round(df_2017_log_sum_c[2], 2), "(", round(df_2017_log_sum_c[7], 2), ")",sep = ''),
+      paste(round(df_2017_log_sum_c[3], 2), "(", round(df_2017_log_sum_c[8], 2), ")",sep = ''),
+      paste(round(df_2017_log_sum_c[4], 2), "(", round(df_2017_log_sum_c[9], 2), ")",sep = ''),
+      paste(round(df_2017_log_sum_c[5], 2), "(", round(df_2017_log_sum_c[10], 2), ")",sep = ''),
+      paste(table(df_2017_log$BPMEDS)[2],"(", round((table(df_2017_log$BPMEDS)[2]/sum(table(df_2017_log$BPMEDS)))*100), "%)",sep = ''),
+      paste(table(df_2017_log$DIABETES)[2],"(", round((table(df_2017_log$DIABETES)[2]/sum(table(df_2017_log$DIABETES)))*100), "%)",sep = ''),
+      paste(table(df_2017_log$SEX)[2],"(", round((table(df_2017_log$SEX)[2]/sum(table(df_2017_log$SEX)))*100), "%)",sep = ''),
+      paste(table(df_2017_log$CURSMOKE)[2],"(", round((table(df_2017_log$CURSMOKE)[2]/sum(table(df_2017_log$CURSMOKE)))*100), "%)",sep = ''))
+
+sum_df <- cbind(report_vars,sum_df)
+colnames(sum_df) <- c('Variables','Summary')
+sum_df %>% 
+  kable(booktabs = TRUE, caption = "Logged Variable Summary of Nhanes Data") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") 
+
+```
+
+The reason for representing logged summary is that we make assumptions in the first data generation mechanism that all continuous variables follow a normal distribution after log transformation. This is a rather strong assumption and also the assumption *A1: Independence of the outcome Y and the population S, conditional on covariates from the paper* [@steingrimsson2022]. Therefore in the first data generation, we will generate each continuous variable based solely on the mean and sd from the above table and each binary variable as randomly generated number following binomial distribution with proportion of from the table as probability parameter. We run the simulation 5000 times, each simulation we generate 4000 cases of individual level data to match the actual Nhanes data, and get the average result for both men and women subset.
+
+```{r}
+sim_dat_1 <- function(n){
+  
+  sysbp <- exp(rnorm(n,4.83,0.14))
+  totalchl <- exp(rnorm(n,5.24,0.21))
+  age <- exp(rnorm(n,3.93,0.24))
+  hdlc <- exp(rnorm(n,3.93,0.28))
+  bmi <- exp(rnorm(n,3.39,0.23))
+  
+  bpmeds_cova <- rbinom(n,size = 1,prob=0.326)
+  diab_cova <- rbinom(n,size = 1,prob=0.165)
+  sex <- rbinom(n,size = 1,prob=0.516)
+  smoke <- rbinom(n,size = 1,prob=0.202)
+  df <- as.data.frame(cbind(totalchl,age,sysbp,hdlc,bmi,bpmeds_cova,diab_cova,sex,smoke))
+  names(df) <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES",'SEX','CURSMOKE')
+  
+  df <- df %>% 
+  # Eligibility Criteria
+  filter(AGE>30 , AGE<74) %>% 
+  # new cols
+  mutate(SYSBP_UT = ifelse(BPMEDS == 0, 
+                           SYSBP, 0)) %>% 
+  mutate(SYSBP_T = ifelse(BPMEDS == 1, 
+                          SYSBP, 0)) %>% 
+  # source column
+  mutate(source=0) %>%
+  
+  mutate_at(factor_col,as.factor)
+  
+  return(df)
+}
+```
+
+```{r}
+sim_dat_pool_1 <- list()
+for (i in 1:1000) {
+  
+  object_name <- paste("sim_", i, sep = "")
+  
+  data <- sim_dat_1(n=4000)
+  
+  sim_dat_pool_1[[object_name]] <- data
+  
+}
+
+result_m_1 <- c()
+result_w_1 <- c()
+
+for (i in 1:length(sim_dat_pool_1)) {
+
+  set.seed(2550)
+  
+  df <- sim_dat_pool_1[[i]]
+  
+  df_men <- df[df$SEX==0,]
+  df_women <- df[df$SEX==1,]
+  
+  test_index_m <- sample(c(TRUE, FALSE), size = nrow(df_men), replace = TRUE, prob = c(0.25, 0.75))
+  test_index_w <- sample(c(TRUE, FALSE), size = nrow(df_women), replace = TRUE, prob = c(0.25, 0.75))
+
+  sim_train_m <- bind_rows(framingham_men_train,df_men[!test_index_m,])  
+  sim_test_m <- bind_rows(framingham_men_test, df_men[test_index_m,]) 
+  
+  sim_train_w <- bind_rows(framingham_women_train, df_women[!test_index_w,])
+  sim_test_w <- bind_rows(framingham_women_test, df_women[test_index_w,])
+  
+  result_m_1[i] <- get_brier(train_dat = sim_train_m,test_data = sim_test_m)
+  result_w_1[i] <- get_brier(train_dat = sim_train_w,test_data = sim_test_w)
+}
+```
+
+In the second data generation mechanism, we will use information from Framingham data to inform simulation of Nhanes data. By assuming multivariate normal distribution of all continuous variables, we will generate all the continuous variable of Nhanes data by using means from log transformed Nhanes original data and covariance matrix from log transformed Framingham data. For binary variable, since the proportion of each level for variable 'BPMEDS' and 'DIABETES' is very imbalanced in Framingham data, indicated form the above summary, we will generate them as usual of binomial distribution. For 'CURSMOKE' and 'SEX', we prefitted a logistic regression of each against the remaining variables using log transformed Framingham data. During the simulation stage, we will use these models to generate the variables for Nhanes data. This way, we hope to catch relationships and correlations between variables within the Framingham data, and use such information to help simulation of Nhanes data. We run the simulation 5000 times, each simulation we generate 4000 cases of individual level data to match the actual Nhanes data, and get the average result for both men and women subset.
+
+```{r}
+mu_nehanes <- colMeans(df_2017_log[,continuous_vars],na.rm = T)
+cov_framingham <- cov(framingham_df_log[,continuous_vars])
+
+# simulate over a range
+mod_sex <- glm(SEX ~ TOTCHOL+AGE+SYSBP+HDLC+BMI+BPMEDS+DIABETES, family = 'binomial',data = framingham_df_log)
+
+mod_smoke <- glm(CURSMOKE ~ TOTCHOL+AGE+SYSBP+HDLC+BMI+BPMEDS+DIABETES, family = 'binomial',data = framingham_df_log)
+
+sim_dat_2 <- function(n){
+  
+  continuous_cova <- as.data.frame(mvrnorm(n=n,mu=mu_nehanes,Sigma = cov_framingham ))
+  
+  bpmeds_cova <- as.factor(rbinom(n,size = 1,prob=0.326))
+  diab_cova <- as.factor(rbinom(n,size = 1,prob=0.165))
+  
+  df <- as.data.frame(cbind(continuous_cova,bpmeds_cova,diab_cova)) 
+  names(df) <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES")
+  
+  sex <- ifelse(predict(mod_sex,newdata = df,type = 'response')>0.5,1,0)
+  smoke <- ifelse(predict(mod_smoke,newdata = df,type = 'response')>0.5,1,0)
+  
+  df <- as.data.frame(cbind(df,sex,smoke)) 
+  names(df) <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES",'SEX','CURSMOKE')
+  
+  df[,continuous_vars] <- exp(continuous_cova)
+  
+  df <- df %>% 
+  # Eligibility Criteria
+  filter(AGE>30 , AGE<74) %>% 
+  # new cols
+  mutate(SYSBP_UT = ifelse(BPMEDS == 0, 
+                           SYSBP, 0)) %>% 
+  mutate(SYSBP_T = ifelse(BPMEDS == 1, 
+                          SYSBP, 0)) %>% 
+  # source column
+  mutate(source=0) %>%
+  
+  mutate_at(factor_col,as.factor)
+  
+  return(df)
+}
+```
+
+```{r}
+sim_dat_pool_2 <- list()
+for (i in 1:1000) {
+  
+  object_name <- paste("sim_", i, sep = "")
+  
+  data <- sim_dat_2(n=4000)
+  
+  sim_dat_pool_2[[object_name]] <- data
+  
+}
+
+result_m_2 <- c()
+result_w_2 <- c()
+
+for (i in 1:length(sim_dat_pool_2)) {
+
+  set.seed(2550)
+  
+  df <- sim_dat_pool_2[[i]]
+  
+  df_men <- df[df$SEX==0,]
+  df_women <- df[df$SEX==1,]
+  
+  test_index_m <- sample(c(TRUE, FALSE), size = nrow(df_men), replace = TRUE, prob = c(0.25, 0.75))
+  test_index_w <- sample(c(TRUE, FALSE), size = nrow(df_women), replace = TRUE, prob = c(0.25, 0.75))
+
+  sim_train_m <- bind_rows(framingham_men_train,df_men[!test_index_m,])  
+  sim_test_m <- bind_rows(framingham_men_test, df_men[test_index_m,]) 
+  
+  sim_train_w <- bind_rows(framingham_women_train, df_women[!test_index_w,])
+  sim_test_w <- bind_rows(framingham_women_test, df_women[test_index_w,])
+
+  result_m_2[i] <- get_brier(train_dat = sim_train_m,test_data = sim_test_m)
+  result_w_2[i] <- get_brier(train_dat = sim_train_w,test_data = sim_test_w)
+
+  }
+```
+
+For the third data generation, we will exploit the package 'fitdistrplus'[@fitdistrplus] to find the best distribution. This tool helped us compare different distributions and select the one that matched our data the closest, based on statistical tests (AIC) and visual plots. The distribution we chose and its parameters were crucial in creating a realistic synthetic dataset for our study on the Framingham risk score model's applicability to different populations.
+
+```{r}
+library(fitdistrplus)
+distribution_names <- c("norm", "exp", "gamma", "lnorm")
+
+find_fits <- function(df){
+
+  fits <- list()
+  for (dist_name in distribution_names) {
+  fit <- fitdist(df, dist_name)
+  fits[[dist_name]] <- fit
+  }
+  
+  aic_values <- sapply(fits, function(fit) fit$aic)
+  best_fit <- names(fits)[which.min(aic_values)]
+  
+  return(
+    list(fits[[best_fit]]$distname,fits[[best_fit]]$estimate)
+  )
+}
+```
+
+We provide four candidate distribution: normal, exponential, gamma and log normal. Then we would fit each continuous variables withe the four candidates and select the best fit by lowest AIC values. The result is displayed as below. All variables except 'HDLC' is determined to be log normal distribution, and HDLC is best selected as gamma distribution. Following this, we will make the third data generation process follow their respective distribution and parameters. All binary variables are generated as the first generation. We run the simulation 5000 times, each simulation we generate 4000 cases of individual level data to match the actual Nhanes data, and get the average result for both men and women subset.
+
+```{r}
+#descdist(framingham_df$TOTCHOL, discrete=FALSE, boot=500)
+
+chl_fit <- find_fits(framingham_df$TOTCHOL)
+
+age_fit <- find_fits(framingham_df$AGE)
+
+hdlc_fit <- find_fits(framingham_df$HDLC)
+
+bmi_fit <- find_fits(framingham_df$BMI)
+
+sysbp_fit <- find_fits(framingham_df$SYSBP)
+
+fit_list <- list(chl_fit,age_fit,hdlc_fit,bmi_fit,sysbp_fit)
+
+fit_names <- sapply(fit_list, function(list) list[[1]])
+param_vals <- round(sapply(fit_list, function(list) list[[2]]),4)
+
+fit_tab <- rbind(fit_names,param_vals)
+colnames(fit_tab) <- c("TOTCHOL","AGE","HDLC","BMI","SYSBP")
+row.names(fit_tab) <- c('Distribution','meanlog_shape','sdlog_rate')
+
+fit_tab %>% 
+  kable(booktabs = TRUE, caption = "Best Distribution fit for Continuous variables") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position")
+```
+
+```{r}
+sim_dat_3 <- function(n){
+
+  sysbp <- rlnorm(n, 4.91845791788465, 0.156296253388122)
+  totalchl <- rlnorm(n, 5.45326364860203, 0.185912494277935)
+  age <- rlnorm(n, 4.07113791586455, 0.124473761542617)
+  hdlc <- rgamma(n, 10.3745119984891, 0.21140498576664)
+  bmi <- rlnorm(n, 3.24271921386657, 0.14663705862075)
+  
+  bpmeds_cova <- rbinom(n,size = 1,prob=0.326)
+  diab_cova <- rbinom(n,size = 1,prob=0.165)
+  sex <- rbinom(n,size = 1,prob=0.516)
+  smoke <- rbinom(n,size = 1,prob=0.202)
+  df <- as.data.frame(cbind(totalchl,age,sysbp,hdlc,bmi,bpmeds_cova,diab_cova,sex,smoke))
+  names(df) <- c("TOTCHOL","AGE","SYSBP","HDLC","BMI","BPMEDS","DIABETES",'SEX','CURSMOKE')
+  
+  
+  df <- df %>% 
+  # Eligibility Criteria
+  filter(AGE>30 , AGE<74) %>% 
+  # new cols
+  mutate(SYSBP_UT = ifelse(BPMEDS == 0, 
+                           SYSBP, 0)) %>% 
+  mutate(SYSBP_T = ifelse(BPMEDS == 1, 
+                          SYSBP, 0)) %>% 
+  # source column
+  mutate(source=0) %>%
+  
+  mutate_at(factor_col,as.factor)
+  
+  
+  return(df)
+}
+```
+
+```{r}
+sim_dat_pool_3 <- list()
+for (i in 1:1000) {
+  
+  object_name <- paste("sim_", i, sep = "")
+  
+  data <- sim_dat_3(n=4000)
+  
+  sim_dat_pool_3[[object_name]] <- data
+  
+}
+
+result_m_3 <- c()
+result_w_3 <- c()
+
+for (i in 1:length(sim_dat_pool_3)) {
+
+  set.seed(2550)
+  
+  df <- sim_dat_pool_3[[i]]
+  
+  df_men <- df[df$SEX==0,]
+  df_women <- df[df$SEX==1,]
+  
+  test_index_m <- sample(c(TRUE, FALSE), size = nrow(df_men), replace = TRUE, prob = c(0.25, 0.75))
+  test_index_w <- sample(c(TRUE, FALSE), size = nrow(df_women), replace = TRUE, prob = c(0.25, 0.75))
+
+  sim_train_m <- bind_rows(framingham_men_train,df_men[!test_index_m,])  
+  sim_test_m <- bind_rows(framingham_men_test, df_men[test_index_m,]) 
+  
+  sim_train_w <- bind_rows(framingham_women_train, df_women[!test_index_w,])
+  sim_test_w <- bind_rows(framingham_women_test, df_women[test_index_w,])
+  
+  result_m_3[i] <- get_brier(train_dat = sim_train_m,test_data = sim_test_m)
+  result_w_3[i] <- get_brier(train_dat = sim_train_w,test_data = sim_test_w)
+  }
+  
+```
+
+Finally, we compile all the results together into this table. The true result is represented as the result we get first hand from the individual level data of Nhanes. Through comparison, we can see that data generation 1 has the closest model performance in terms of transportability analysis with the true result. The third generation mechanism, which includes testing of univariate distribution, has relative large value of brier scores. This means the model trained on Framingham data generate poorly on the data simulated under this mechanism. Then we make comments on the simulation bias and standard errors:
+
+1.  **Type 1 Data Generation**: This type shows a bias of -0.0191 for man and 0.0073 for women , indicating a slight systematic deviation from the true value. The standard error suggests low variability in the results across different simulation runs.
+
+2.  **Type 2 Data Generation**: For this category, the bias of 0.0346 for man and -0.025 for women, which means the simulation results are quite consistent over the true value to. The standard error reflects greater consistency in the simulation outputs compared to Type 1.
+
+3.  **Type 3 Data Generation**: This type has a bias of 0.1488 for man and 0.1468 for women, showing the most significant deviation from the true value among the three types. Its standard error, indicates the biggest spread in results.
+
+In each case, the bias and SE collectively provide insight into the accuracy and reliability of the simulations under different data generation scenarios. Comparing these metrics across the three types helps identify which method aligns closest with the true values and offers the most consistent results.
+
+```{r}
+# comparison
+final_dat <- rbind(c(round(brier_list_men[6],4),
+                     paste(round(mean(result_m_1), 4), "(", round(sd(result_m_1) / sqrt(length(result_m_1)),6), ")",sep = ''),
+                     paste(round(mean(result_m_2), 4), "(", round(sd(result_m_2) / sqrt(length(result_m_2)),6), ")",sep = ''),
+                     paste(round(mean(result_m_3), 4), "(", round(sd(result_m_3) / sqrt(length(result_m_3)),6), ")",sep = '')),
+                   c(round(brier_list_women[6],4),
+                     paste(round(mean(result_w_1), 4), "(", round(sd(result_w_1) / sqrt(length(result_w_1)),6), ")",sep = ''),
+                     paste(round(mean(result_w_2), 4), "(", round(sd(result_w_2) / sqrt(length(result_w_2)),6), ")",sep = ''),
+                     paste(round(mean(result_w_3), 4), "(", round(sd(result_w_3) / sqrt(length(result_w_3)),6), ")",sep = '')))
+
+rownames(final_dat) <- c('Men','Women')
+colnames(final_dat) <- c('True','Gen_1','Gen_2','Gen_3')
+
+final_dat %>% 
+  kable(booktabs = TRUE, caption = "Average Brier Score Comparison between True and differnt data generation") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") %>%
+footnote(general = "Result is presented as Mean(SE)")
+
+bias_dat <- rbind(c(
+  paste(round(mean(result_m_1-brier_list_men[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_m_1-brier_list_men[6])^2)) ,6), ")",sep = ''),
+  paste(round(mean(result_m_2-brier_list_men[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_m_2-brier_list_men[6])^2)) ,6), ")",sep = ''),
+  paste(round(mean(result_m_3-brier_list_men[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_m_3-brier_list_men[6])^2)) ,6), ")",sep = '')),
+  c(
+  paste(round(mean(result_w_1-brier_list_women[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_w_1-brier_list_women[6])^2)) ,6), ")",sep = ''),
+  paste(round(mean(result_w_2-brier_list_women[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_w_2-brier_list_women[6])^2)) ,6), ")",sep = ''),
+  paste(round(mean(result_w_3-brier_list_women[6]), 4), "(", round(sqrt( (1/(5000*4999)) * mean((result_w_3-brier_list_women[6])^2)) ,6), ")",sep = '')
+))
+
+rownames(bias_dat) <- c('Men','Women')
+colnames(bias_dat) <- c('Gen_1','Gen_2','Gen_3')
+
+bias_dat %>% 
+  kable(booktabs = TRUE, caption = "Simulation Bias Comparison between differnt data generation") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") %>%
+footnote(general = "Result is presented as Bias(SE)")
+```
+
+# Conclusion and Discussion
+
+The transportability of the CVD prediction model from the Framingham source population to the NHANES target population, as evidenced by our simulation results showing low bias and low standard error, marks a significant advancement in predictive modeling. The model's commendable predictive accuracy in both male and female subsets of the NHANES data not only underscores its potential for broader application but also aligns with our study's goal of assessing model applicability across diverse populations. This gender-based differentiation in predictive accuracy further stresses the importance of considering sex-specific variations in CVD risk factors, enriching our understanding of how prediction models can be tailored for individual subgroups within different populations.
+
+However, this analysis does bear certain limitations. Primarily, the assumptions of representativeness between the source and target populations, and the methodological simplifications in our simulation study, may not fully address all demographic and lifestyle differences between the Framingham and NHANES cohorts. In line with the reference paper, the assumptions of the independence of outcome Y and the population S conditional on covariates, and positivity, are critical. Our findings, particularly in the simulation segment demonstrating the significant effect of different target data distribution assumptions on the performance of the source-derived model, echo this sentiment. This indicates the necessity for model customization when applying it to the target data.
+
+Additionally, while the Brier Score served as a primary metric for evaluation, a more comprehensive analysis incorporating additional performance metrics such as AUC and ROC curves, especially in classification tasks, could provide a broader perspective on the model's transportability. Nonetheless, it is essential to adapt these estimators to the unique context where outcome data in the source variable may be limited or absent.
+
+In conclusion, these findings, promising as they are, highlight the need for continued research to further refine and validate the model's performance across diverse, real-world target populations. This includes employing a wider array of evaluation measures and considering potential changes over time in the target populations, thereby aligning with the initial objectives set forth in our report.
+
+# Reference
