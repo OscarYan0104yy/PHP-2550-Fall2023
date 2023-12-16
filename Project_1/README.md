@@ -19,3 +19,9 @@ Packages used:
 | psych        | 2.3.6     |
 | ggridges     | 0.5.4     |
 | ggpubr       | 0.6.0     |
+
+File Management:
+
+Project_1_eda.Rmd <- report code
+
+Project_1_eda.pdf <- report 
