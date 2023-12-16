@@ -1,0 +1,780 @@
+---
+title: "Modeling Tracheostomy Necessity in sBPD: A Regression Analysis Approach"
+author: "Yu Yan"
+date: "2023-10-31"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(error = F)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(message = F)
+library(tidyverse)
+library(kableExtra)
+library(mice)
+library(gtsummary)
+library(psych)
+library(ggridges)
+ library(pROC)
+library(caret)
+library(glmnet)
+library(parallel)# Load the parallel package
+library(glmm)
+library(lme4)
+```
+
+# Abstract
+Background: The prediction of need for tracheostomy placement in severe bronchopulmonary dysplasia (sBPD) is debated. This project, involving Dr. Robin McKinney, MD and Dr. Chris Schmid, employs multicenter registry data to predict tracheostomy or death outcomes in sBPD patients.
+
+Aim: To generate a predictive model that aids in determining the timing of tracheostomy in sBPD cases.
+
+Methods: Utilizing demographic, diagnostic, and respiratory data from NICU patients, the study develops three models: a logistic regression with lasso penalty, and two mixed-effects multilevel models using lasso and best-subset variable selection methods, essential for model interpretability and prediction accuracy. Missing data is managed through multiple imputation, with variable selection informed by cross-validation to prevent overfitting.
+
+Conclusion: The predictive models derived from this comprehensive analysis are anticipated to facilitate early diagnostic prediction and guide clinical decision-making. The multifold methodological approach ensures a robust and interpretable model, promising to advance the management of sBPD with significant implications for patient care and family counseling. The importance of domain knowledge when finalizing a model in usage should be stressed.
+
+# Introduction
+This report outlines a predictive modeling approach for tracheostomy placement need in severe bronchopulmonary dysplasia (sBPD). Collaborating with Dr. Robin McKinney, MD and Dr. Chris Schmid, we utilize the BPD Collaborative Registry, which provides demographic, diagnostic, and respiratory data for infants with sBPD across different NICUs.  The data, capturing respiratory support parameters in both 36 and 44 weeks informs the development of our regression models. Despite challenges such as missing values, our analysis aims to offer clinicians data-driven guidance on tracheostomy placement, potentially enhancing care for sBPD patients.
+
+```{r}
+# Read Data
+df <- read.csv('project2.csv')
+```
+
+# Exploratory Analysis
+
+Then we conduct Exploratory Data Analysis to identify any irregular and meaningful patterns in the dataset.
+There is a observation that is repeated four times in the data (id = 2000824), and we should only kept one of its record.
+Then for the outcome, we are presented with two binary outcomes 'Death' and 'Trach', each stands for death and tracheotomy placement.
+We decide to combine both into a composite outcome variable as 'res'.
+In the context, this is a binary variable meaning negative outcomes where 1 including dead or having tracheotomy placement, and 0 other wise.
+While combining, we discovered there are two observations whose 'Death' outcome is missing, case 879 and 191.
+And by examining their predictors, we decided to code 'Death' of 191 to be 'No', since it has record for a hospital discharge week.
+This may imply the patient not dead, and drop 879 since it does not have a valid hospital discharge week, we can not infer.
+Then we examining the 'center' variable.
+By looking at the distribution of center(its a multi-center study) from table 2, center 20 and 21 have very few cases, 4 and 1.
+We decided to drop those observations as their small sample will not provide valid and valuable predictions for incoming patients in those two centers if we are going to include center as one of the variables in the model.
+
+```{r}
+# var_type management 
+# Remove Duplicates
+duplicate_id <- unique(df$record_id)[table(df$record_id) > 1] 
+df <- df[-which(df$record_id==duplicate_id)[-1],] 
+
+# Mutate Outcome, two death missing
+Death_NA <- df[!df$Death%in%c('No','Yes'),]
+
+# Delete obs 879 (Death NA) because NO discharge 
+df <- df[-879,]
+
+# Change obs 191 since have discharge 
+df$Death[191] <- 'No'
+
+df$res <- ifelse(df$Death == 'Yes'|df$Trach=='1',1,0)
+
+df <- df[,-c(29,30)]
+
+# Alter center var
+# Delete 20,21
+t(table(df$center)) %>% 
+  kable(booktabs = TRUE, caption = "Distribution of number of cases by Center") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") 
+  
+df <- df[!df$center %in% c(20,21),]
+
+df$center[is.na(df$center)] <-1
+
+# Numeric list
+num_var_list <- c("bw","ga","blength","birth_hc","weight_today.36","inspired_oxygen.36",
+                  "p_delta.36","peep_cm_h2o_modified.36","weight_today.44","inspired_oxygen.44",
+                  "p_delta.44","peep_cm_h2o_modified.44","hosp_dc_ga")
+# factor list
+facor_var_list <- names(df)[-1][!names(df)[-1]%in%num_var_list]
+
+# change to numeric
+df <- df %>% mutate_at(num_var_list,as.numeric)
+
+# change to factor
+df <- df %>% mutate_at(facor_var_list,as.factor)
+```
+
+Next we start evalutaing outliers.
+For the importance of hospital discharge in the data, we plotted the variable and discovered there may be two outlier whose hospital dicharge weeks are bigger than 300.
+which is very far deviated from the most of the records.
+So we decided to drop these two cases since their presence may interfere our later model building process.
+In addition, we discover there are three patients who have a dischage week less then 36 recorded but also have multiple record for 36 week measurement in the dataset.
+We decided this may be error of recording in the data and removed those three observations.
+
+```{r}
+# Remove outlier of discharge
+
+
+# Remove bigger than 300 based on plot
+df <- df[-which(df$hosp_dc_ga > 300),]
+
+# Remove obs discharged before 36 but have 36 records 
+# Need to ensure no obs have record after discharged
+df <- df[-c(which(df$hosp_dc_ga < 36)),]
+
+
+# change anysurf 
+df$any_surf <- ifelse(!df$any_surf %in% c('Yes','No'), 'Missing',df$any_surf)
+
+df$any_surf <- factor(df$any_surf , levels = c('2','1','Missing'), labels = c('Yes','No','Missing'))
+
+
+# Remove Race
+df <- df[,-3]
+```
+
+# Missing variables
+
+We examined the holistically missingness pattern in the data set and display variables that are more than 20% of the case is missing.
+The reason for choosing 20% is not a strict threshold.
+We can see from the table 1 that all of the 44 week related measurements and 'any_surf' are those that selected.
+Their missing percentage is about 40% as shown.
+
+```{r}
+# Missing pattern identification
+#df <- as.data.frame(apply(df, 2, function(x) ifelse(x=='',NA,x)))
+
+# Compute missing summary table
+missing_byvar <- as.data.frame(apply(df[,-1], 2, function(x) sum(is.na(x)))) %>% rename('Missing_num'= "apply(df[, -1], 2, function(x) sum(is.na(x)))") %>% 
+  filter(Missing_num!=0) %>% 
+  arrange(desc(Missing_num)) %>% 
+  mutate('Missing_Pct'= round((Missing_num / nrow(df)) * 100))%>% 
+  filter(Missing_Pct > 20)
+
+missing_byvar %>% 
+  kable(booktabs = TRUE, caption = "Variables with missing more than 20 Percent") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") 
+```
+
+However, this missing pattern is partially missing since for observations that are discharged from hospital before 44 weeks, they by nature shouldn't be having a value for all the 44 week measurements.
+We than further incorporated this information and regenerated the following missingness summary.
+
+```{r}
+# look at how many 4 vars are missing due to discharge
+id_44 <- df$record_id[df$hosp_dc_ga < 44]
+
+missing_44 <- as.data.frame(apply(df[,c("weight_today.44","ventilation_support_level_modified.44","inspired_oxygen.44","p_delta.44","peep_cm_h2o_modified.44","med_ph.44")], 2, function(x) sum(is.na(x[df$hosp_dc_ga > 44]))))
+
+names(missing_44) <- 'Missing_num'
+  
+missing_44 <- missing_44 %>% 
+  arrange(desc(Missing_num)) %>% 
+  mutate('Missing_Pct'= round((Missing_num / nrow(df)) * 100))
+ 
+missing_44 %>% 
+    kable(booktabs = TRUE, caption = "Missing Pattern of 44 week after discharge") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position") 
+
+# Consider weeks  variables seperately 
+var_44 <- c("weight_today.44","ventilation_support_level_modified.44","inspired_oxygen.44","p_delta.44","peep_cm_h2o_modified.44","med_ph.44")
+
+var_36 <- c("weight_today.36","ventilation_support_level.36","inspired_oxygen.36","p_delta.36","peep_cm_h2o_modified.36","med_ph.36" )
+
+df_36 <- df[, !names(df) %in% var_44]
+```
+
+We can see that their missing percentage dropped significantly to about 20%.
+Those are the actual missing at random portion for the dataset and the majority occurred on 44 week measurement variables.
+
+So we may considered drop those variables and only build the model based on 36 week measurements.
+Since for a variable having more than 20% of missingness, imputation methods may not generate stable and unbiased predictions to fill in the gap.
+Despite those variables, we do have other predictors that are having missingness and we considering using Multivariate Imputation by Chain Equation (MICE)[@mice] to generate imputed data set for model training and testing.
+
+After finishing all the variable-specific checking, we are finalized with the dataset for model buidling.
+The following is a summary table of the remaining variables stratified by center.
+We want to see the significantly different variables among each centers and trying to identify potential interaction terms to add in the model building.
+By only displaying highly significantly different variables, we realize most of the numeric measurement variables are highly significant ones.
+This may be due to some systemic settings differing in each center, for example, different measuring equipment in terms of brand and versions.
+Therefore, we consider the aspect of a multilevel modeling with different centers as one of the model type candidate in the sections that follows.
+
+```{r}
+# Data Demographic Summary 
+df_36 %>% select(all_of(names(df_36))) %>%
+ tbl_summary(by=center, 
+             statistic = list(
+               all_continuous() ~ "{mean} ({sd})",
+               all_categorical() ~ "{n} / {N} ({p}%)"),
+             type = list(bw~'continuous',
+                         ga~'continuous',
+                         blength~'continuous',
+                         birth_hc~'continuous',
+                         weight_today.36~'continuous',
+                         inspired_oxygen.36~'continuous',
+                         p_delta.36~'continuous',
+                         peep_cm_h2o_modified.36~'continuous',
+                         hosp_dc_ga~'continuous'),
+             missing_text = "NA") %>% 
+  modify_spanning_header(c("stat_4", "stat_5") ~ "**Treatnment Center**") %>% 
+  add_p(all_categorical()~"chisq.test", pvalue_fun = ~ style_pvalue(.x, digits = 2)) %>% 
+  filter_p(t = 0.05) %>%
+  # convert to kableExtra
+  as_kable_extra(booktabs = TRUE) %>%
+  # reduce font size to make table fit. 
+  kableExtra::kable_styling(full_width = T, font_size = 7)
+
+```
+
+Before we move on to talk about model building, we would like to access the correlation between all continuous variables in the finalized dataset using corrplot function from package corrplot[@corrplot].
+For the elements in plot, each box and circle within it represent a pair of variables aligned with the axis.
+An external color scheme on the right represent direction and value of correlation statistics.
+Positive correlations are displayed in blue and negative correlations in red color.
+Color intensity and the size of the circle are proportional to the correlation coefficients.
+We can observe that there seem to be relatively high correlations between the pairs of bw with blength,ga,birth_hc; blength with ga,birth_hc; ga with birth_hc ;and inspired_oxygen.36 with p_delta.36.
+As a result, we would consider adding their respective interaction terms into all the different types of model that we will build and evaluate.
+
+```{r, fig.height = 4, fig.width = 8, fig.align = "center"}
+
+library(corrplot)
+res <- cor(df_36 %>% select(c(bw,ga,blength,birth_hc,weight_today.36,inspired_oxygen.36,
+                  p_delta.36,peep_cm_h2o_modified.36)), use = "complete.obs")
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+
+#interactions: bw*(blength+ga+birth_hc) + blength*(ga+birth_hc) + ga*birth_hc + inspired_oxygen.36+p_delta.36
+```
+
+# Variable Selection and Model Building
+
+The general model building process is demonstrated in this section.
+The overall goal is to have three models in total.
+First one is a cross-validated logistic regression model with lasso penalty as center regarded as a fixed effect, second one is a mixed effects multilevel model with cross-validated variable selections(exclude center) using lasso methods, and the third one is a mixed effects multilevel model with cross-validated variable selections(exclude center) using best-subset methods.
+The reasons for choose lasso and best-subset are based on their variable selection abilities by incorporating penalty during model building process.
+And also the center variable is considered both as a fixed effect and random effect in two parts of the model building.
+They will be discussed in more detail later.
+
+Before training model in each part, we are considering performing variable selection so that we may come up with a sparse and concise model that are highly interpret, and able for early diagnostic prediction of the composite clinical outcome for the patients.
+The analysis aims using two methods and will validate the results of both methods in the model development stage.
+The two methods are Lasso and best subset, and both will incorporate cross validation for robustness and prevent over fitting.
+The reasons for choosing best subset rather than forward step wise regression are as follows: best subset ensures to find the best model by examining all possible combinations while step wise may not guarantee this by providing local optimal, and step wise may be subject to the ordering of predictors when dealing with many predictors.
+We have clearly more observations than the number of predictors so the over fitting problem of best subset may not occur.
+To overcome the computational burden, we found functions incorporate coordinate descent while searching (eg.l0learn[@L0Learn]) and also implement parallel computation both for lasso and best subset.
+
+Before doing variable selection, we will split the data into train and test sets, and perform model processing on the train set.
+The preserved test sets will be saved and used for final validation after we acquire optimal combination of variables and models from both methods.
+With respect to the missing data, we will utilize technique of multiple imputation while doing variable selection.
+We preset for each imputation proportion of training and test set, and save each training and testing.
+The general scheme of variable selection is to perform cross validated variable selection methods on each of the imputed data set and combine those results into a final set as the variables that are selected.
+
+For both methods, we are tuning different variables and utilize them differently for the purpose of variable selection.
+For lasso, since its penalized regularization will shrink certain coefficients of variables to be 0, we would see for each imputed data set, what are the variable coefficients its outputting with k-fold cross validation.
+We do not refit the lasso model after variable selection as it has been refitted in each cross validation.
+
+On the other hand, best subset can be considered 'L0L2' penalty and we will also extract the coefficients generated by the minimal lambda value producing minimal cross validation errors.
+
+The variable selection procedures are different in the two parts.
+For the first lasso, center is included as a fixed effect and we will directly retrain lasso model using the minimal lambda from cross validation results.
+For the other two relating to multilevel models, we will first perform variable selection without center and get the combined results of selected variables to retrain a multilevel model with center being the random effect on the fully combined train set.
+
+All of the three models will be evaluated on the same test data set in the end.
+
+## Test train split
+
+For Train and test data split, we incorporate the inbuilt feature of MICE() function.
+We set the number of imputation to be five and conduct multiple imputation separately for train and test.
+This way, the training and testing data do not have impact on each other, which makes evaluation less biased.
+So we will have 5 unique train and 5 unique test data sets.
+
+```{r}
+set.seed(2550)
+
+splitIndex <- createDataPartition(df_36$center, p = 1/4, list = FALSE)
+
+df_36_test <- df_36[splitIndex,] %>% select(-record_id)
+
+df_36_train <- df_36[-splitIndex,] %>% select(-record_id)
+```
+
+```{r}
+set.seed(2550)
+
+# Train imputation
+imp_train <- mice(df_36_train,m = 5, print = FALSE, seed = 2550)
+
+# Test imputation
+imp.test <- mice(df_36_test,m = 5, print = FALSE, seed = 2550)
+
+# Store each imputed data set (Train)
+df_36_imp_train <- vector("list",5)    
+for (i in 1:5){
+  df_36_imp_train[[i]] <- mice::complete(imp_train,i) 
+}
+df_36_imp_train_long <- mice::complete(imp_train,action="long")
+
+
+# Store each imputed data set (Test)
+df_36_imp_test <- vector("list",5)    
+for (i in 1:5){
+  df_36_imp_test[[i]] <- mice::complete(imp.test,i) 
+}
+
+df_36_imp_test_long <- mice::complete(imp.test,action="long")
+```
+
+### Lasso(center as fixed effect)
+
+This is the result for lasso approach.
+In this lasso model, center is regarded as a fixed effect, and interaction mentioned above is included as well.
+The result oresented is the final model coefficients.
+We can see the selected variables and their respective coefficients.
+The interpretation of the coefficients inline with the logistic regression.
+For a continuous predictor variable has a positive coefficient, it means that as the value of that predictor increases, the log-odds of the event happening (i.e., the probability of res outcome being 1, meaning bad outcome) also increases.
+And for categorical predictors variable has a positive coefficient, it means that being in the particular level increases the log-odds of the event happening (i.e., the probability of res outcome being 1, meaning bad outcome) in comparison to reference level.
+And negative coefficients meaning the opposite.
+
+So for this lasso model, we can say that having Prenatal Corticosteroids and higher Fraction of Inspired Oxygen at 36 weeks are two example of positively associated predictors to the outcome, meaning patients with such traits are highly likely to develop bad outcomes (eg. Trachoestomy Placement or Death).
+
+```{r }
+lasso <- function(df) { 
+  #' Runs 10-fold CV for lasso and returns corresponding coefficients 
+  #' @param df, data set
+  #' @return coef, coefficients for minimum cv error
+  
+  # Exclude hosp-discharge from model building
+  df <- df[,names(df)!='hosp_dc_ga']
+  # Matrix form for ordered variables 
+  x.ord <- model.matrix(res~.+bw*(blength+ga+birth_hc) + blength*(ga+birth_hc) + ga*birth_hc + inspired_oxygen.36*p_delta.36, data = df)[,-1] 
+  y.ord <- df$res
+  
+  # Generate folds
+  k <- 10 
+  set.seed(2550) # consistent seeds between imputed data sets
+  folds <- sample(1:k, nrow(df), replace=TRUE)
+  
+  # Lasso model
+  lasso_mod_cv <- cv.glmnet(x.ord, y.ord, nfolds = 10, foldid = folds, 
+                         alpha = 1, family = "binomial")
+  lasso_mod <- glmnet(x.ord, y.ord, nfolds = 10,alpha = 1,family = 'binomial',
+                      lambda = lasso_mod_cv$lambda.min)
+  
+  # Get coefficients 
+  coef <- coef(lasso_mod) 
+  return(coef) 
+} 
+
+# Specify the number of CPU cores to use
+num_cores <- 8  # Adjust this to the number of cores you want to use
+
+# Use mclapply to apply the forward function in parallel to each data frame
+lasso_list <- mclapply(df_36_imp_train, lasso, mc.cores = num_cores)
+
+# Merge results
+lasso_coef_dat <- data.frame(cbind(
+      round(lasso_list[[1]][,1],4),
+      round(lasso_list[[2]][,1],4),
+      round(lasso_list[[3]][,1],4),
+      round(lasso_list[[4]][,1],4),
+      round(lasso_list[[5]][,1],4)))
+
+lasso_coef_dat <- lasso_coef_dat %>% mutate(coef_final <- rowMeans(lasso_coef_dat),num_zero <- rowSums(lasso_coef_dat == 0))
+
+colnames(lasso_coef_dat) <- c('Train1','Train2','Train3','Train4','Train5','coef_mean','num_zero')
+
+# Checking times of zero
+lasso_coef_dat$coef_final <- ifelse(lasso_coef_dat$num_zero > 3, 0, lasso_coef_dat$coef_mean)
+
+# Adjust coefficients table 
+lasso_c <- lasso_coef_dat %>% filter(coef_final != 0) %>% select(coef_final) %>% rownames_to_column(var = "RowName") 
+
+names(lasso_c) <- c('Variable','Estimated Coefficients')
+
+# Display model outcome
+lasso_c %>% 
+  kable(booktabs = TRUE, caption = "Final Model for Lasso approach") %>%
+  kable_styling(full_width = F, latex_options = "hold_position") %>%
+  column_spec(2, width = "150px")  
+```
+
+### Multilevel(center as random effect)
+
+In this section, we have first conducted variable selection using both lasso and best subset approach excluding center.
+And then take the cross validated results as the most significant variables with the outcome 'res', fit on combined training data, a multilevel model with the selected variables as fixed effects and center incorporated as random effect.
+We aim to capture the center specific characteristics and patterns to the data and make the prediction model more designated and personalized.
+
+The comparative results for both variable selection and final multilevel coefficients are presented next to each other for a better visualization.
+
+```{r}
+# lasso and then lmer with the selected vars
+lasso_nocenter <- function(df) { 
+  #' Runs 10-fold CV for lasso and returns corresponding coefficients 
+  #' @param df, data set
+  #' @return coef, coefficients for minimum cv error
+  
+  # Exclude hosp-discharge from model building
+
+  df <- df[,names(df)!=c('center','hosp_dc_ga')]
+  
+  # Matrix form for ordered variables 
+  x.ord <- model.matrix(res~.+bw*(blength+ga+birth_hc) + blength*(ga+birth_hc) + ga*birth_hc + inspired_oxygen.36*p_delta.36, data = df)[,-1] 
+  y.ord <- df$res
+  
+  # Generate folds
+  k <- 10 
+  set.seed(2550) # consistent seeds between imputed data sets
+  folds <- sample(1:k, nrow(df), replace=TRUE)
+  
+  # Lasso model
+  lasso_mod_cv <- cv.glmnet(x.ord, y.ord, nfolds = 10, foldid = folds, 
+                         alpha = 1, family = "binomial")
+  lasso_mod <- glmnet(x.ord, y.ord, nfolds = 10,alpha = 1,family = 'binomial',
+                      lambda = lasso_mod_cv$lambda.min)
+  
+  # Get coefficients 
+  coef <- coef(lasso_mod) 
+  return(coef) 
+} 
+
+# Specify the number of CPU cores to use
+num_cores <- 8  # Adjust this to the number of cores you want to use
+
+# Use mclapply to apply the forward function in parallel to each data frame
+lasso_noc_list <- mclapply(df_36_imp_train, lasso_nocenter, mc.cores = num_cores)
+
+# Merge results
+lasso_noc_coef_dat <- data.frame(cbind(
+      round(lasso_noc_list[[1]][,1],4),
+      round(lasso_noc_list[[2]][,1],4),
+      round(lasso_noc_list[[3]][,1],4),
+      round(lasso_noc_list[[4]][,1],4),
+      round(lasso_noc_list[[5]][,1],4)))
+
+lasso_noc_coef_dat <- lasso_noc_coef_dat %>% mutate(coef_final <- rowMeans(lasso_noc_coef_dat),num_zero <- rowSums(lasso_noc_coef_dat == 0))
+
+colnames(lasso_noc_coef_dat) <- c('Train1','Train2','Train3','Train4','Train5','coef_mean','num_zero')
+
+# Checking times of zero
+lasso_noc_coef_dat$coef_final <- ifelse(lasso_noc_coef_dat$num_zero > 3, 0, lasso_noc_coef_dat$coef_mean)
+
+# Adjust coefficients table 
+lasso_noc <- lasso_noc_coef_dat %>% filter(coef_final != 0) %>% select(coef_final) %>% rownames_to_column(var = "RowName")
+
+names(lasso_noc) <- c('Variable','Estimated Coefficients')
+
+
+# lasso.multilevel
+fit.lasso <- glmer(res ~ mat_ethn+birth_hc+del_method+prenat_ster+mat_chorio+gender+sga+any_surf+weight_today.36+ventilation_support_level.36+inspired_oxygen.36+peep_cm_h2o_modified.36+med_ph.36+ga*birth_hc + (1|center),family = binomial,data=df_36_imp_train_long)
+
+```
+
+```{r}
+library(L0Learn)
+
+bestsubset <- function(df){
+   #' Runs 10-fold CV for bestsubset(l0penalty) and returns corresponding coefficients 
+   #' @param df, data set
+   #' @return coef, coefficients for minimum cv error
+  
+ 
+  df <- df[,names(df)!='hosp_dc_ga']
+  # remove center
+  df <- df[,-1]
+  best.mat <- model.matrix(res~.+bw*(blength+ga+birth_hc) + blength*(ga+birth_hc) + ga*birth_hc + inspired_oxygen.36*p_delta.36, data = df)[,-1]
+  best.y <- df$res
+  p = ncol(best.mat)
+
+  best.mod <- L0Learn.cvfit(x=best.mat,y=best.y,loss = 'Logistic',penalty = 'L0L2',nFolds = 10,seed = 2550,intercept = T)
+
+  c <- coef(best.mod,lambda = best.mod$fit$lambda[[1]][which.min(best.mod$cvMeans[[1]])])
+  
+  best.coef <- numeric(length = p+1)
+  
+ 
+  best.coef[c@i+1] <- c@x
+
+  names(best.coef) <- c('(Intercept)',colnames(best.mat))
+  
+  return(best.coef)
+}
+
+# Use mclapply to apply the forward function in parallel to each data frame
+bessubset_list <- mclapply(df_36_imp_train, bestsubset,mc.cores = num_cores)
+
+
+bestsubset_coef_dat <- cbind(
+                        round(bessubset_list[[1]],4),
+                        round(bessubset_list[[2]],4),
+                        round(bessubset_list[[3]],4),
+                        round(bessubset_list[[4]],4),
+                        round(bessubset_list[[5]],4))
+
+bestsubset_coef_dat <- as.data.frame(bestsubset_coef_dat)
+colnames(bestsubset_coef_dat) <- c('Train1','Train2','Train3','Train4','Train5')
+
+bestsubset_coef_dat <- bestsubset_coef_dat %>% mutate(coef_final <- rowMeans(bestsubset_coef_dat),num_zero <- rowSums(bestsubset_coef_dat == 0))
+
+colnames(bestsubset_coef_dat) <- c('Train1','Train2','Train3','Train4','Train5','coef_mean','num_zero')
+
+# Checking times of zero
+bestsubset_coef_dat$coef_final <- ifelse(bestsubset_coef_dat$num_zero > 3, 0, bestsubset_coef_dat$coef_mean)
+
+
+# Extract non-zero coefficients and Adjust coefficients table 
+bestsubset <- bestsubset_coef_dat %>% filter(coef_final != 0) %>% select(coef_final) %>% rownames_to_column(var = "RowName")
+
+names(bestsubset) <- c('Variable','Estimated Coefficients')
+
+
+
+fit.bestsubset <- glmer(res ~ mat_ethn + blength + del_method+prenat_ster+com_prenat_ster+ mat_chorio+sga+ any_surf+ventilation_support_level.36+inspired_oxygen.36+p_delta.36+peep_cm_h2o_modified.36+med_ph.36 +inspired_oxygen.36*p_delta.36  + (1|center),family = binomial,data=df_36_imp_train_long)
+
+```
+
+From the following summary of variable selection, We can see that both methods picked on different main effects and different interaction terms among ones that we identified.
+The coefficients relate to criteria for variable selection from both methods, as variables with a coefficient of 0 are considered non impact to the outcome.
+
+```{r}
+# report results of variable selection for both
+
+cbind(rbind(lasso_noc[-1,],c('',''),c('','')),bestsubset[-1,])%>% 
+  kable(booktabs = TRUE, caption = "Summary of variable selection results",
+        col.names = c('Variables_L','Coefficients_L','Variable_B','Coefficients_B'),
+        row.names = FALSE) %>% 
+footnote(general = "L is Lasso ; B is Best-subset") %>% 
+  kable_styling(full_width = F, latex_options = "hold_position") %>%
+  column_spec(2, width = "150px") 
+```
+
+In table 6, we present the final model and model coefficients for the above two methods.
+We used the package modelsummary[@modelsummary] for better presentation.
+Significant coefficients are marked stars and standard error in parentheses.
+The standard deviation for the random effect, center are 1.695 and 1.399 respectively.
+Model evaluation matrices are presented at below such as R2 and AIC,BIC.
+Lasso approach is slightly better performed.
+
+```{r}
+library(modelsummary)
+#modelsummary_wide(fit.bestsubset,stars =TRUE, title ='Multilevel RegressionModelResultsfor Student Engagement.')
+
+modelsummary(list("Lasso"=fit.lasso, 'Bestsubset'=fit.bestsubset),stars =TRUE, title ='Multilevel Comparison')
+```
+
+We will then take the three of our model to evaluate and compare on the test set.
+
+```{r eval=F}
+# Multilevel Lasso
+  ## Set the lambda grid - first calculate the maximum
+  ## Make the combined set for glmmLasso function
+
+
+xy.ord <- cbind(imp.data$center, x.ord_wo_center)
+  xy.ord <- cbind(xy.ord, y.ord)
+  colnames(xy.ord)[1] <- "center"
+  colnames(xy.ord)[ncol(xy.ord)] <- "outcome"
+  xy.ord <- data.frame(xy.ord)
+  xy.ord$center <- factor(imp.data$center)
+  
+  
+  xy.ord <- cbind(imp.data$center, x.ord_wo_center)
+  xy.ord <- cbind(xy.ord, y.ord)
+  colnames(xy.ord)[1] <- "center"
+  colnames(xy.ord)[ncol(xy.ord)] <- "outcome"
+  xy.ord <- data.frame(xy.ord)
+  xy.ord$center <- factor(imp.data$center)
+  
+  lambda_max <- max(abs(colSums(x.ord * ifelse(y.ord == 1, mean(y.ord), mean(y.ord)-1))))
+  
+  # write out the formula
+  glmmLasso_formula <- formula(
+    paste0("res ~ ", paste0(
+      colnames(xy.ord)[!colnames(xy.ord) %in% c("center", "outcome")], 
+      collapse = " + ")))
+  
+multilevel.lasso <- function(df){
+  
+  df <- df_36_imp_train[[1]]
+  
+  df$folds <- sample(1:5, 736, replace = TRUE)
+  x.mat <- model.matrix(res ~. , 
+                                  data = df[,-c(1,22)])[,-1]
+  x.mat <- scale(x.mat, center=TRUE,scale=TRUE)
+
+  y.mat <- factor(df$res)  
+  
+  fit.dat <- cbind(df$center,x.mat,y.mat)
+  colnames(fit.dat)[1] <- "center"
+  colnames(fit.dat)[ncol(fit.dat)] <- "res"
+  fit.dat <- data.frame(fit.dat)
+  fit.dat$center <- factor(df$center)
+  
+  glmmLasso_formula <- formula(
+    paste0("res ~ ", paste0(
+      colnames(fit.dat)[!colnames(fit.dat) %in% c("center", "res")], 
+      collapse = " + ")))
+  
+  for (k in 1:5) {
+    
+  # fit on 4 folds
+  fit.dat.cv <- fit.dat[df$folds != 1, ]
+  
+  glmmLasso_mod <-glmmLasso(glmmLasso_formula, rnd = list(center=~1),
+                   lambda=20, 
+                   family = binomial(link = "logit"), data = fit.dat.cv)
+  
+      # test on the fold left
+      glmmLasso_pred <- predict(glmmLasso_mod, 
+                                newdata = xy.ord[folds == fold, ], 
+                                type = "response")
+      # AUC
+      AUC_set_final[j, fold] <- as.numeric(auc(xy.ord[folds == fold, "outcome"],
+                           glmmLasso_pred))
+  }
+}
+```
+
+# Model Evaluation
+
+After acquiring all final models and their coefficients, we will evaluate the model on the test dataset.
+Since the models are logistic in nature, we propose the following model metrics as criteria for evaluation: 'AUC', 'Accuracy','Sensitivity','Specificity','Positive Predictive Value','Negative Predictive Value','F1', and also ROC curve for all models.
+
+```{r}
+# Get matrix function
+get_metrics_coef <- function(coef){
+  #' Get metrics from beta and gamma
+  #' 
+  #' Calculates deviance, accuracy, sensitivity, and specificity
+  #' @param coef coefficient of previously selected variables
+  #' @return list with deviance (dev), accuracy (acc), sensitivity (sens), and 
+  #' specificity (spec), 
+
+  # Establish test matrix and true class
+  test_xmat <- model.matrix(res~.+bw*(blength+ga+birth_hc) + blength*(ga+birth_hc) + ga*birth_hc + inspired_oxygen.36*p_delta.36, data = df_36_imp_test_long[,-c(1,2,22)])
+  test_y <- df_36_imp_test_long$res
+
+  #coef <- as.matrix(lasso_coef_dat$coef_final)
+  # Get predicted probs and classes
+  v <- test_xmat %*% coef
+  p <- exp(v)/(1+exp(v))
+  
+  roc_obj <- roc(test_y,p)
+  auc <- auc(roc_obj)[1]
+  optimal_cutoff <- coords(roc_obj, "best", ret = "threshold")
+  
+  pred <- ifelse(p>=optimal_cutoff[1,], 1, 0)
+  # Confusion matrix
+  tp <- sum(pred == 1 & test_y == 1)
+  tn <- sum(pred == 0 & test_y == 0)
+  fp <- sum(pred == 1 & test_y == 0)
+  fn <- sum(pred == 0 & test_y == 1)
+  
+  # Accuracy values
+  acc <- (tp+tn)/(tp+tn+fp+fn)
+  sens <- tp/(tp+fn)
+  spec <- tn/(tn+fp)
+  ppv <- tp/(tp+fp)
+  npv <- tn/(tn+fn)
+  f1 <- 2*ppv*sens / (ppv+sens)
+  
+  
+  return(list(auc=auc, acc=acc, sens=sens, spec=spec, ppv=ppv, npv=npv, f1=f1, roc_obj = roc_obj))
+}
+
+get_metrics_mod <- function(mod){
+  #' Get metrics from the trained model
+  #' 
+  #' Calculates deviance, accuracy, sensitivity, and specificity
+  #' @param model pre-trained model
+  #' @return list with deviance (dev), accuracy (acc), sensitivity (sens), and 
+  #' specificity (spec), 
+
+
+  # Establish test matrix and true class
+  test_y <- df_36_imp_test_long$res
+
+  # Get predicted probs and classes
+  p <- predict(mod,newdata=df_36_imp_test_long[,-c(1,2,23)],type='response')
+  pred <- ifelse(p>=0.4, 1, 0)
+
+  roc_obj <- roc(test_y,p)
+  auc <- auc(roc_obj)[1]
+  optimal_cutoff <- coords(roc_obj, "best", ret = "threshold")
+
+  pred <- ifelse(p>=optimal_cutoff[1,], 1, 0)
+
+  # Confusion matrix
+  tp <- sum(pred == 1 & test_y == 1)
+  tn <- sum(pred == 0 & test_y == 0)
+  fp <- sum(pred == 1 & test_y == 0)
+  fn <- sum(pred == 0 & test_y == 1)
+  
+  # Accuracy values
+  acc <- (tp+tn)/(tp+tn+fp+fn)
+  sens <- tp/(tp+fn)
+  spec <- tn/(tn+fp)
+  ppv <- tp/(tp+fp)
+  npv <- tn/(tn+fn)
+  f1 <- 2*ppv*sens / (ppv+sens)
+  
+  
+  return(list(auc=auc, acc=acc, sens=sens, spec=spec, ppv=ppv, npv=npv, f1=f1, roc_obj = roc_obj))
+}
+
+```
+
+In overall, the two models' performance are comparable across different metrics.
+They have very similar AUC and accuracy, and their ROC curve also look very align, indicating the relative robustness in predicting new cases.
+The threshold was selected based on ROC curve, it is chosen as a point that maximize Youden's J statistic to achieve balance between sensiticity and specificity.
+In the context of model, any false positive predictions may lead to unnecessary placement of tracheotomy.
+This can be devastating both biologically for the patient and economically for the family.
+And may also lead to over-medication.
+So the final decision to choose the model between the three presented ones can be very subjective and dependent on numerous factors, especially when their accuracy is close.
+It really boils down to the real-world scenario and application fields of such model, for example, ease of collection of data, quality of data and so on.
+
+```{r}
+lasso_coef <- as.matrix(lasso_coef_dat$coef_final)
+lasso_matrics <- get_metrics_coef(coef = lasso_coef)
+
+lasso_c_metrics <- get_metrics_mod(fit.lasso)
+best_c_metrics <- get_metrics_mod(fit.bestsubset)
+
+
+# Plot ROC Curve
+par(mfrow = c(1,3))
+plot(lasso_matrics$roc_obj,main='Roc Curve for Lasso(center as fixed effect)',print.auc = TRUE, print.auc.y = 0.2, print.auc.x = 0.6)
+plot(lasso_c_metrics$roc_obj,main='Roc Curve for multilevel(lasso)',print.auc = TRUE, print.auc.y = 0.2, print.auc.x = 0.6)
+plot(best_c_metrics$roc_obj,main='Roc Curve for multilevel(bestsubset)',print.auc = TRUE, print.auc.y = 0.2, print.auc.x = 0.6)
+
+# Combine evaluation results
+evaluaion <- as.data.frame(rbind(unlist(lasso_matrics[1:7]),unlist(lasso_c_metrics[1:7]),unlist(best_c_metrics[1:7])),
+                        row.names = c('Lasso','multilevel(lasso)','multilevel(bestsubset)'))
+
+colnames(evaluaion) <- c('AUC', 'Accuracy','Sensitivity','Specificity','Positive Predictive Value','Negativc Predictive Value','F1')
+
+evaluaion %>% 
+  kable(booktabs = TRUE, caption = "Model Evaluation") %>%
+  kable_styling(full_width = TRUE, latex_options = "hold_position")
+```
+
+# Discussion and Limitation
+
+This report outlines the step-by-step process of building regression models to predict a critical outcome: tracheostomy placement or patient mortality.
+The objective is to help determine need of placement for tracheostomy.
+We start by examining the data's characteristics and ensuring its quality by addressing missing information.
+We then explore the data, making transformations, removing unnecessary variables, and checking for unusual data points.
+Afterward, we select the most relevant variables, construct our models, and finally evaluate their performance.
+
+In the end, we present three regression models---one, center as fixed effect model and the other two multilevel model where center is considered as random effect.
+All models perform well in terms of different performance matrics.
+
+However, it's important to recognize that this study has limitations and unexplored aspects that could further improve predictive accuracy and model applicability.
+While our focus has been on regression models, the problem we're addressing also has classification aspects.
+In future investigations, we could explore a broader range of machine learning methods, both supervised and unsupervised such as RandomForest, and we can apply ensemble learning to train the model.
+
+For model variable interaction, we could apply more measure to look for correaltions between continuous variables and categorical variables and find valuable pairs of interaction or even three way. 
+
+Moreover, our original goal was to predict outcomes using data from both 36 and 44 weeks.
+However, as we've shown, the 44 week data is missing on a significant level. Other imputation methods or other ways could be incorporated to include the 44 week aspect.
+
+Future research could explore how our models perform with better data quality and advanced data imputation techniques, like Bayesian network learning.
+
+Lastly, it's worth noting that both of our final models include a considerable number of predictors, which may not be necessary in every clinical prediction scenario, particularly in emergency care situations, as it will make interpretation harder.
+Achieving sparsity, or a simpler model with fewer predictors, is a potential goal.
+Techniques like integer risk models and categorizing variables could be explored to achieve this, although it may involve a trade-off between simplicity and predictive accuracy, and some valuable information could be lost.
+
+# Reference
